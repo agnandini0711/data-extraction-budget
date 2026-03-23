@@ -1,0 +1,500 @@
+---
+title: "Data Extraction from Government Budget PDF"
+author: "Nandini Agarwal"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+## Objective
+
+This project extracts structured financial data from a government budget PDF (`Gr09.pdf`).
+
+* Page 3 → Division of Grant
+* Page 6 → Other Taxes and Duties
+
+---
+
+## Load Libraries
+
+```{r}
+# ===============================
+# LOAD LIBRARIES
+# ===============================
+library(tabulapdf)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(readr)
+library(pdftools) 
+```
+
+---
+
+## Load File
+
+```{r}
+file_path <- "Gr09.pdf"
+```
+
+---
+
+# ===============================
+
+# PAGE 3: DIVISION OF GRANT
+
+# ===============================
+
+```{r}
+# -------------------------------
+# 1. Extract: Division of Grant (Page 3)
+# -------------------------------
+division_tables <- extract_tables(
+  file_path,
+  pages = 3,
+  method = "stream",     # better for text-based tables
+  output = "tibble"
+)
+
+# Combine multiple tables (if extracted)
+division_raw <- bind_rows(division_tables)
+
+# Rename numeric columns for clarity
+colnames(division_raw)[3:6] <- c("Actuals", "BE", "RE", "BE_next")
+
+
+# -------------------------------
+# Function to clean broken Hindi text
+# -------------------------------
+fix_hindi <- function(x) {
+  x %>%
+    str_replace_all("कुलि योग", "कुल योग") %>%          # fix total label
+    str_replace_all("योग\\s*:\\s*राजस्वि?", "योग : राजस्व") %>%
+    str_replace_all("योग\\s*:\\s*पजंी", "योग : पूंजी") %>%
+    str_replace_all("मतदये|मतदये", "मतदेय") %>%       # voted
+    str_replace_all("भािरत|भािरत", "भारित") %>%       # charged
+    str_squish()                                       # remove extra spaces
+}
+
+# Mapping: Major head → Hindi description
+hindi_head_map <- c(
+  "2045" = "वस्तुओं तथा सेवाओं पर अन्य कर तथा शुल्क",
+  "2049" = "ब्याज अदायगियां",
+  "2059" = "लोक निर्माण कार्य",
+  "2071" = "पेंशन तथा अन्य सेवा निवृत्ति हित लाभ",
+  "2801" = "बिजली",
+  "4801" = "बिजली परियोजनाओं पर पूंजीगत व्यय",
+  "6003" = "राज्य सरकार का आन्तरिक ऋण",
+  "6801" = "बिजली परियोजनाओं के लिए ऋण"
+)
+
+
+# -------------------------------
+# 2. Clean data (Page 3)
+# -------------------------------
+clean_division <- function(df) {
+  
+  # Rename first two columns
+  colnames(df)[1:2] <- c("Description", "Type")
+  
+  df %>%
+    
+    # Remove completely empty rows
+    filter(!(is.na(Description) & is.na(Type))) %>%
+    
+    # Clean Hindi text
+    mutate(
+      Description = fix_hindi(Description),
+      Type = fix_hindi(Type)
+    ) %>%
+    
+    # Extract major head (first 4 digits)
+    mutate(
+      major_head = str_extract(Description, "^[0-9]{4}")
+    ) %>%
+    
+    # Fill missing major head downward
+    fill(major_head, .direction = "down") %>%
+    
+    # Extract numeric values from columns
+    mutate(
+      Actuals_22_23 = as.numeric(str_extract(Actuals, "[0-9.]+")),
+      BE_23_24      = as.numeric(str_extract(BE, "[0-9.]+")),
+      RE_23_24      = as.numeric(str_extract(RE, "[0-9.]+")),
+      BE_24_25      = as.numeric(str_extract(BE_next, "[0-9.]+"))
+    ) %>%
+    
+    # Replace NA with 0
+    mutate(
+      across(
+        c(Actuals_22_23, BE_23_24, RE_23_24, BE_24_25),
+        ~replace_na(., 0)
+      )
+    ) %>%
+    
+    # Identify category (Voted / Charged / Total)
+    mutate(
+      Category = case_when(
+        grepl("मतदेय", paste(Description, Type)) ~ "Voted",
+        grepl("भारित", paste(Description, Type)) ~ "Charged",
+        grepl("योग", Description) ~ "Total",
+        TRUE ~ "Other"
+      )
+    ) %>%
+    
+    # Keep only relevant columns
+    select(
+      major_head,
+      Description,
+      Category,
+      Actuals_22_23,
+      BE_23_24,
+      RE_23_24,
+      BE_24_25
+    )
+}
+
+# Apply cleaning function
+division_clean <- clean_division(division_raw)
+
+
+# -------------------------------
+# 3. Structure data (Page 3)
+# -------------------------------
+division_ready <- division_clean %>%
+  
+  # Fill missing descriptions
+  fill(Description, .direction = "down") %>%
+  
+  # Remove useless rows (all zero + Other)
+  filter(
+    !(Category == "Other" & 
+        Actuals_22_23 == 0 & 
+        BE_23_24 == 0 &
+        RE_23_24 == 0 & 
+        BE_24_25 == 0)
+  ) %>%
+  
+  # Identify hierarchy level
+  mutate(
+    level = case_when(
+      grepl("कुल योग", Description) ~ "Grand Total",
+      grepl("योग : राजस्व", Description) ~ "Revenue Total",
+      grepl("योग : पूंजी", Description) ~ "Capital Total",
+      grepl("^[0-9]{4}", Description) ~ "Detail",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  
+  # Assign Hindi labels
+  mutate(
+    head_name_hi = case_when(
+      level == "Revenue Total" ~ "राजस्व खाता कुल",
+      level == "Capital Total" ~ "पूंजी खाता कुल",
+      level == "Grand Total" ~ "कुल योग",
+      TRUE ~ hindi_head_map[major_head]
+    ),
+    
+    # Final Hindi column
+    head_name = head_name_hi  
+  )
+
+
+# -------------------------------
+# 4. English mapping
+# -------------------------------
+major_head_map <- c(
+  "2045" = "Other Taxes & Duties on Commodities and Services",
+  "2049" = "Interest Payments",
+  "2059" = "Public Works",
+  "2071" = "Pensions and Other Retirement Benefits",
+  "2801" = "Power",
+  "4801" = "Capital Outlay on Power Projects",
+  "6003" = "Internal Debt of State Government",
+  "6801" = "Loans for Power Projects",
+  "REV_TOTAL" = "Revenue Account Total",
+  "CAP_TOTAL" = "Capital Account Total",
+  "GRAND_TOTAL" = "Grand Total"
+)
+
+
+# -------------------------------
+# 5. Convert to long format
+# -------------------------------
+division_long <- division_ready %>%
+  
+  # Convert wide → long
+  pivot_longer(
+    cols = c(Actuals_22_23, BE_23_24, RE_23_24, BE_24_25),
+    names_to = "year_type",
+    values_to = "value"
+  ) %>%
+  
+  # Add readable year labels
+  mutate(
+    year = case_when(
+      year_type == "Actuals_22_23" ~ "2022-23",
+      year_type == "BE_23_24"      ~ "2023-24 (BE)",
+      year_type == "RE_23_24"      ~ "2023-24 (RE)",
+      year_type == "BE_24_25"      ~ "2024-25"
+    ),
+    
+    # English labels (override totals correctly)
+    head_name_en = case_when(
+      level == "Revenue Total" ~ "Revenue Account Total",
+      level == "Capital Total" ~ "Capital Account Total",
+      level == "Grand Total" ~ "Grand Total",
+      TRUE ~ major_head_map[major_head]
+    )
+  )%>%
+  
+  # Keep final columns
+  select(
+    major_head,
+    head_name,
+    head_name_en,
+    Category,
+    level,
+    year,
+    value
+  )
+
+
+# -------------------------------
+# 6. Convert to wide format
+# -------------------------------
+division_wide <- division_long %>%
+  
+  # Convert long → wide
+  pivot_wider(
+    names_from = year,
+    values_from = value
+  ) %>%
+  
+  # Sort logically
+  arrange(
+    factor(level, levels = c("Detail", "Revenue Total", "Capital Total", "Grand Total")),
+    major_head,
+    Category
+  ) %>%
+  
+  # Rename Category → Type
+  mutate(Type = Category) %>%
+  
+  # Final column order
+  select(
+    major_head,
+    head_name,
+    head_name_en,
+    Type,
+    `2022-23`,
+    `2023-24 (BE)`,
+    `2023-24 (RE)`,
+    `2024-25`
+  )
+
+
+# -------------------------------
+# Output files
+# -------------------------------
+write_excel_csv(division_wide, "division_of_grant_wide.csv")
+write_excel_csv(division_long, "division_of_grant_long.csv")
+
+# Preview output
+head(division_wide)
+head(division_long)
+```
+
+---
+
+# ===============================
+
+# PAGE 6: OTHER TAXES AND DUTIES
+
+# ===============================
+
+```{r}
+# Extract full text
+pdf_text_data <- pdf_text(file_path)
+
+# Split page 6 into lines
+lines <- pdf_text_data[6] %>%
+  str_split("\n") %>%
+  unlist() %>%
+  str_trim()
+
+# Remove empty lines
+lines <- lines[lines != ""]
+
+
+# -------------------------------
+# 1: Extract numeric data
+# -------------------------------
+other_taxes_df <- tibble(raw = lines) %>%
+  mutate(
+    row_id = row_number(),
+    
+    # Replace missing "--" with 0
+    raw_clean = str_replace_all(raw, "--", "0"),
+    
+    # Extract all numbers
+    nums = str_extract_all(raw_clean, "[0-9.]+"),
+    
+    # Keep rows with enough numeric values
+    valid = lengths(nums) >= 4
+  ) %>%
+  filter(valid) %>%
+  
+  # Assign numeric columns
+  mutate(
+    Actuals_22_23 = as.numeric(sapply(nums, `[`, 1)),
+    BE_23_24      = as.numeric(sapply(nums, `[`, 2)),
+    RE_23_24      = as.numeric(sapply(nums, `[`, 3)),
+    BE_24_25      = as.numeric(sapply(nums, function(x) tail(x, 1))),
+    
+    # Extract item code
+    item_code = str_extract(raw_clean, "[0-9]{2}(?=\\s*-)"),
+    
+    # Extract description text
+    description = raw_clean %>%
+      str_remove("^[0-9.]+\\s+[0-9.]+\\s+[0-9.]+\\s+") %>%
+      str_remove("\\s+[0-9.]+$") %>%
+      str_replace("^[0-9]{2}\\s*-\\s*", "") %>%
+      str_squish(),
+    
+    # Identify totals
+    is_total = str_detect(raw_clean, "योग")
+  )
+
+
+# -------------------------------
+# 2: Extract hierarchy
+# -------------------------------
+hierarchy_full <- tibble(raw = lines) %>%
+  mutate(
+    row_id = row_number(),
+    
+    # Identify year rows
+    is_year_row = str_detect(raw, "^[0-9]{4}-[0-9]{4}"),
+    
+    # Extract hierarchy levels
+    major_head = ifelse(!is_year_row, str_extract(raw, "^[0-9]{4}(?=\\s*-)"), NA),
+    sub_head   = ifelse(!is_year_row, str_extract(raw, "^[0-9]{3}(?=\\s*-)"), NA),
+    sub_sub    = ifelse(!is_year_row, str_extract(raw, "^[0-9]{2}(?=\\s*-)"), NA)
+  ) %>%
+  
+  # Fill hierarchy downward
+  fill(major_head, sub_head, sub_sub, .direction = "down")
+
+
+# -------------------------------
+# 3: Combine and clean
+# -------------------------------
+other_taxes_final <- other_taxes_df %>%
+  left_join(hierarchy_full, by = "row_id") %>%
+  
+  # Remove unwanted rows
+  filter(
+    !str_detect(raw_clean, "202[0-9]"),
+    (Actuals_22_23 < 1900 & !is_total) | is_total
+  ) %>%
+  
+  mutate(
+    # Define row type
+    row_type = case_when(
+      is_total ~ "Total",
+      !is.na(item_code) ~ "Item"
+    ),
+    
+    # Hindi description
+    description_hi = case_when(
+      row_type == "Total" ~ "योग",
+      TRUE ~ str_squish(description)
+    )
+  ) %>%
+  
+  # Keep valid rows only
+  filter(row_type %in% c("Item", "Total"))
+
+
+# Hindi mapping (item codes)
+hindi_code_map <- c(
+  "01"="वेतन","02"="मजदूरी","03"="महंगाई भत्ता","04"="यात्रा व्यय",
+  "05"="स्थानांतरण यात्रा व्यय","06"="अन्य भत्ते","07"="मानदेय",
+  "08"="कार्यालय व्यय","09"="विद्युत शुल्क","10"="जल शुल्क",
+  "11"="लेखन सामग्री","12"="फर्नीचर एवं उपकरण","13"="टेलीफोन व्यय",
+  "15"="वाहन रखरखाव","16"="व्यावसायिक सेवाएं","17"="किराया एवं कर",
+  "18"="प्रकाशन","26"="मशीनरी एवं उपकरण","44"="प्रशिक्षण व्यय",
+  "45"="विकास यात्रा","46"="कंप्यूटर खरीद","47"="कंप्यूटर रखरखाव",
+  "49"="चिकित्सा व्यय","51"="विदेश व्यय",
+  "55"="मकान किराया भत्ता","58"="आउटसोर्स सेवाएं"
+)
+
+# Apply Hindi mapping
+other_taxes_final <- other_taxes_final %>%
+  mutate(
+    description_hi = case_when(
+      row_type == "Total" ~ "योग",
+      TRUE ~ recode(item_code, !!!hindi_code_map)
+    )
+  )
+
+
+# -------------------------------
+# 4: English labels
+# -------------------------------
+code_map <- c(
+  "01"="Salary","02"="Wages","03"="Dearness Allowance","04"="Travel Expenses",
+  "05"="Transfer Travel Expenses","06"="Other Allowances","07"="Honorarium",
+  "08"="Office Expenses","09"="Electricity Charges","10"="Water Charges",
+  "11"="Stationery and Printing","12"="Office Furniture and Equipment",
+  "13"="Telephone Expenses","15"="Vehicle Maintenance and Fuel",
+  "16"="Professional Services","17"="Rent, Rates and Taxes",
+  "18"="Publications","26"="Machinery and Equipment",
+  "44"="Training Travel Expenses","45"="Development Travel Expenses",
+  "46"="Computer Hardware/Software Purchase","47"="Computer Maintenance",
+  "49"="Medical Expenses","51"="Foreign Expenses",
+  "55"="House Rent Allowance","58"="Outsourced Services"
+)
+
+# Apply English mapping
+other_taxes_final <- other_taxes_final %>%
+  mutate(
+    description_en = case_when(
+      row_type == "Total" ~ "Total",
+      TRUE ~ recode(item_code, !!!code_map)
+    )
+  )
+
+
+# -------------------------------
+# 5: Final formatting
+# -------------------------------
+other_taxes_final <- other_taxes_final %>%
+  mutate(
+    # Round numeric values
+    across(c(Actuals_22_23, BE_23_24, RE_23_24, BE_24_25), ~round(., 2))
+  ) %>%
+  
+  # Select final columns
+  select(
+    major_head, sub_head, sub_sub,
+    row_type, item_code,
+    description_hi, description_en,
+    Actuals_22_23, BE_23_24, RE_23_24, BE_24_25
+  )
+
+# Save output
+write_excel_csv(other_taxes_final, "other_taxes_final.csv")
+
+# Preview output
+head(other_taxes_final)
+```
+
+
